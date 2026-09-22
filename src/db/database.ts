@@ -1,37 +1,89 @@
-import sqlite3 from 'sqlite3';
+import initSqlJs, { Database as SqlJsDatabase } from 'sql.js';
+import fs from 'fs';
+import path from 'path';
 import { config } from '../config';
 
-const db = new sqlite3.Database(config.dbPath);
+let dbInstance: SqlJsDatabase | null = null;
+let initPromise: Promise<SqlJsDatabase> | null = null;
 
-export function runAsync(sql: string, params: any[] = []): Promise<{ lastID: number; changes: number }> {
-  return new Promise((resolve, reject) => {
-    db.run(sql, params, function (err) {
-      if (err) return reject(err);
-      resolve({ lastID: this.lastID, changes: this.changes });
-    });
-  });
+export async function getDb(): Promise<SqlJsDatabase> {
+  if (dbInstance) return dbInstance;
+
+  if (!initPromise) {
+    initPromise = (async () => {
+      const SQL = await initSqlJs({
+        locateFile: (file) => {
+          const wasmPath = path.resolve(process.cwd(), 'node_modules/sql.js/dist', file);
+          if (fs.existsSync(wasmPath)) return wasmPath;
+          return file;
+        },
+      });
+      if (fs.existsSync(config.dbPath)) {
+        try {
+          const fileBuffer = fs.readFileSync(config.dbPath);
+          dbInstance = new SQL.Database(fileBuffer);
+        } catch (_) {
+          dbInstance = new SQL.Database();
+        }
+      } else {
+        dbInstance = new SQL.Database();
+      }
+      return dbInstance;
+    })();
+  }
+
+  return initPromise;
 }
 
-export function getAsync<T = any>(sql: string, params: any[] = []): Promise<T | undefined> {
-  return new Promise((resolve, reject) => {
-    db.get(sql, params, (err, row) => {
-      if (err) return reject(err);
-      resolve(row as T);
-    });
-  });
+export function saveDatabase() {
+  if (!dbInstance) return;
+  try {
+    const dir = path.dirname(config.dbPath);
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const data = dbInstance.export();
+    const buffer = Buffer.from(data);
+    fs.writeFileSync(config.dbPath, buffer);
+  } catch (err) {
+    // Best-effort save in serverless environment
+  }
 }
 
-export function allAsync<T = any>(sql: string, params: any[] = []): Promise<T[]> {
-  return new Promise((resolve, reject) => {
-    db.all(sql, params, (err, rows) => {
-      if (err) return reject(err);
-      resolve(rows as T[]);
-    });
-  });
+export async function runAsync(sql: string, params: any[] = []): Promise<{ lastID: number; changes: number }> {
+  const db = await getDb();
+  db.run(sql, params);
+  const changes = db.getRowsModified();
+  saveDatabase();
+  return { lastID: 0, changes };
+}
+
+export async function getAsync<T = any>(sql: string, params: any[] = []): Promise<T | undefined> {
+  const db = await getDb();
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  let row: T | undefined = undefined;
+  if (stmt.step()) {
+    row = stmt.getAsObject() as T;
+  }
+  stmt.free();
+  return row;
+}
+
+export async function allAsync<T = any>(sql: string, params: any[] = []): Promise<T[]> {
+  const db = await getDb();
+  const stmt = db.prepare(sql);
+  stmt.bind(params);
+  const rows: T[] = [];
+  while (stmt.step()) {
+    rows.push(stmt.getAsObject() as T);
+  }
+  stmt.free();
+  return rows;
 }
 
 export async function initDatabase() {
-  await runAsync(`PRAGMA foreign_keys = ON;`);
+  await getDb();
 
   await runAsync(`
     CREATE TABLE IF NOT EXISTS users (
@@ -87,4 +139,4 @@ export async function initDatabase() {
   `);
 }
 
-export default db;
+export default { getDb, runAsync, getAsync, allAsync, initDatabase };
